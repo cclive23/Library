@@ -56,7 +56,7 @@ function handle_login($username, $password) {
 
             // Redirect based on role
             if ($user['role'] === 'USER') {
-                header("Location: dashboard.php");
+                header("Location: user.php");
             } else { // ADMIN or SADMIN
                 header("Location: admin.php");
             }
@@ -113,12 +113,11 @@ function handle_signup($username, $email, $password, $password2) {
     mysqli_stmt_close($check_stmt);
     
     // Determine role based on email domain
-    $role = (strpos($email, '@fr.com') !== false) ? 'ADMIN' : 'USER';
 
     // Insert new user with role
     $hashed_password = password_hash($password, PASSWORD_DEFAULT);
-    $stmt = mysqli_prepare($conn, "INSERT INTO users (username, email, password, role) VALUES (?, ?, ?, ?)");
-    mysqli_stmt_bind_param($stmt, "ssss", $username, $email, $hashed_password, $role);
+    $stmt = mysqli_prepare($conn, "INSERT INTO users (username, email, password) VALUES (?, ?, ?)");
+    mysqli_stmt_bind_param($stmt, "ssss", $username, $email, $hashed_password,);
     
     if (mysqli_stmt_execute($stmt)) {
         mysqli_stmt_close($stmt);

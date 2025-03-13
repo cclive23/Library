@@ -1,12 +1,135 @@
 <?php
 session_start();
 require_once 'logic.php';
+$conn = get_db_connection();
 
 // Check if user is logged in and has admin privileges
 if (!isset($_SESSION['user_id']) || !isset($_SESSION['role']) || ($_SESSION['role'] != 'ADMIN' && $_SESSION['role'] != 'SADMIN')) {
     header("Location: index.php");
     exit();
 }
+
+$approved_sql = "SELECT b.borrow_id, b.borrow_date, b.due_date, b.admin_approved,
+                              l.title, l.isbn, u.username, a.username as admin_name
+                            FROM borrowings b
+                            JOIN library l ON b.book_id = l.book_id
+                            JOIN users u ON b.user_id = u.id
+                            LEFT JOIN users a ON b.admin_approved = a.id
+                            WHERE b.request = 'approved' AND b.return_date IS NULL
+                            ORDER BY b.borrow_date DESC
+                            LIMIT 10";
+$approved_result = mysqli_query($conn, $approved_sql);
+$approved_count = 1;
+
+if (mysqli_num_rows($approved_result) > 0):
+    while ($approved = mysqli_fetch_assoc($approved_result)): 
+    endwhile;
+endif;
+
+// Add this to the statistics query in your main admin PHP file
+$stats_sql = "SELECT 
+    (SELECT COUNT(*) FROM library) as total_books,
+    (SELECT SUM(total_copies) FROM library) as total_copies,
+    (SELECT SUM(total_copies) - SUM(available_copies) FROM library) as borrowed_copies,
+    (SELECT COUNT(*) FROM borrowings WHERE return_date IS NULL AND request = 'approved') as active_borrowings,
+    (SELECT COUNT(*) FROM borrowings WHERE due_date < NOW() AND return_date IS NULL AND request = 'approved') as overdue_borrowings,
+    (SELECT COUNT(*) FROM users WHERE role = 'USER') as total_users,
+    (SELECT COUNT(*) FROM borrowings WHERE request = 'requested') as pending_requests
+";
+
+// Add this to the admin.php file to handle form submissions
+if (isset($_POST['approve_request'])) {
+    $borrow_id = $_POST['borrow_id'];
+    $book_id = $_POST['book_id'];
+    $user_id = $_POST['user_id'];
+    $admin_id = $_SESSION['user_id']; // Current admin ID
+    
+    // Set due date (e.g., 14 days from now)
+    $due_date = date('Y-m-d H:i:s', strtotime('+14 days'));
+    
+    // Begin transaction
+    mysqli_begin_transaction($conn);
+    
+    try {
+        // Check if user has reached their borrowing limit
+        $user_query = "SELECT allowed, 
+                       (SELECT COUNT(*) FROM borrowings WHERE user_id = ? AND return_date IS NULL AND request = 'approved') as current_borrows 
+                       FROM users WHERE id = ?";
+        $stmt = mysqli_prepare($conn, $user_query);
+        mysqli_stmt_bind_param($stmt, 'ii', $user_id, $user_id);
+        mysqli_stmt_execute($stmt);
+        $user_result = mysqli_stmt_get_result($stmt);
+        $user_data = mysqli_fetch_assoc($user_result);
+        
+        if ($user_data['current_borrows'] >= $user_data['allowed']) {
+            throw new Exception("User has reached their borrowing limit of " . $user_data['allowed'] . " books");
+        }
+        
+        // Update the borrowing record
+        $update_sql = "UPDATE borrowings 
+                      SET request = 'approved', 
+                          due_date = ?, 
+                          book_status = 'borrowed',
+                          admin_approved = ?
+                      WHERE borrow_id = ?";
+        $stmt = mysqli_prepare($conn, $update_sql);
+        mysqli_stmt_bind_param($stmt, 'sii', $due_date, $admin_id, $borrow_id);
+        mysqli_stmt_execute($stmt);
+        
+        // Decrease available copies
+        $update_book_sql = "UPDATE library 
+                           SET available_copies = available_copies - 1 
+                           WHERE book_id = ? AND available_copies > 0";
+        $stmt = mysqli_prepare($conn, $update_book_sql);
+        mysqli_stmt_bind_param($stmt, 'i', $book_id);
+        mysqli_stmt_execute($stmt);
+        
+        // Check if book was updated (available copies > 0)
+        if (mysqli_affected_rows($conn) <= 0) {
+            throw new Exception("No available copies of this book");
+        }
+        
+        // Commit transaction
+        mysqli_commit($conn);
+        echo "<script>alert('Book request approved successfully!');</script>";
+        echo "<script>window.location.href = 'admin.php';</script>";
+    } catch (Exception $e) {
+        // Rollback transaction on error
+        mysqli_rollback($conn);
+        echo "<script>alert('Error: " . $e->getMessage() . "');</script>";
+    }
+}
+
+if (isset($_POST['reject_request'])) {
+    $borrow_id = $_POST['borrow_id'];
+    
+    $reject_sql = "UPDATE borrowings SET request = 'rejected' WHERE borrow_id = ?";
+    $stmt = mysqli_prepare($conn, $reject_sql);
+    mysqli_stmt_bind_param($stmt, 'i', $borrow_id);
+    
+    if (mysqli_stmt_execute($stmt)) {
+        echo "<script>alert('Book request rejected');</script>";
+        echo "<script>window.location.href = 'admin.php';</script>";
+    } else {
+        echo "<script>alert('Error rejecting request');</script>";
+    }
+}
+
+if (isset($_POST['reconsider_request'])) {
+    $borrow_id = $_POST['borrow_id'];
+    
+    $reconsider_sql = "UPDATE borrowings SET request = 'requested' WHERE borrow_id = ?";
+    $stmt = mysqli_prepare($conn, $reconsider_sql);
+    mysqli_stmt_bind_param($stmt, 'i', $borrow_id);
+    
+    if (mysqli_stmt_execute($stmt)) {
+        echo "<script>alert('Book request moved back to pending status');</script>";
+        echo "<script>window.location.href = 'admin.php';</script>";
+    } else {
+        echo "<script>alert('Error updating request status');</script>";
+    }
+}
+
 
 $conn = get_db_connection();
 $is_sadmin = ($_SESSION['role'] == 'SADMIN');
@@ -172,7 +295,7 @@ if (isset($_POST['delete_book'])) {
     $book_id = $_POST['book_id'];
     
     // Check if book is borrowed
-    $check_sql = "SELECT COUNT(*) as count FROM borrowings WHERE book_id = ? AND status = 'borrowed'";
+    $check_sql = "SELECT COUNT(*) as count FROM borrowings WHERE book_id = ? AND book_status = 'borrowed'";
     $check_stmt = mysqli_prepare($conn, $check_sql);
     mysqli_stmt_bind_param($check_stmt, "i", $book_id);
     mysqli_stmt_execute($check_stmt);
@@ -238,8 +361,8 @@ if (isset($_POST['return_book'])) {
     mysqli_begin_transaction($conn);
     
     try {
-        // Update borrowing status
-        $update_borrow_sql = "UPDATE borrowings SET status = 'returned', return_date = NOW() WHERE borrow_id = ?";
+        // Update borrowing book_status
+        $update_borrow_sql = "UPDATE borrowings SET book_status = 'returned', return_date = NOW() WHERE borrow_id = ?";
         $update_borrow_stmt = mysqli_prepare($conn, $update_borrow_sql);
         mysqli_stmt_bind_param($update_borrow_stmt, "i", $borrow_id);
         mysqli_stmt_execute($update_borrow_stmt);
@@ -347,7 +470,7 @@ $borrowings_sql = "SELECT b.*, l.title, l.author, l.book_id, u.username, u.email
                   FROM borrowings b 
                   JOIN library l ON b.book_id = l.book_id 
                   JOIN users u ON b.user_id = u.id 
-                  WHERE b.status = 'borrowed'
+                  WHERE b.book_status = 'borrowed'
                   ORDER BY b.due_date ASC";
 $borrowings_result = mysqli_query($conn, $borrowings_sql);
 
@@ -356,7 +479,7 @@ $overdue_sql = "SELECT b.*, l.title, l.author, l.book_id, u.username, u.email
                FROM borrowings b 
                JOIN library l ON b.book_id = l.book_id 
                JOIN users u ON b.user_id = u.id 
-               WHERE b.status = 'borrowed' AND b.due_date < NOW()
+               WHERE b.book_status = 'borrowed' AND b.due_date < NOW()
                ORDER BY b.due_date ASC";
 $overdue_result = mysqli_query($conn, $overdue_sql);
 
@@ -365,9 +488,10 @@ $stats_sql = "SELECT
               (SELECT COUNT(*) FROM library) as total_books,
               (SELECT SUM(total_copies) FROM library) as total_copies,
               (SELECT SUM(total_copies - available_copies) FROM library) as borrowed_copies,
-              (SELECT COUNT(*) FROM borrowings WHERE status = 'borrowed') as active_borrowings,
-              (SELECT COUNT(*) FROM borrowings WHERE status = 'borrowed' AND due_date < NOW()) as overdue_borrowings,
-              (SELECT COUNT(*) FROM users WHERE role != 'ADMIN' AND role != 'SADMIN') as total_users";
+              (SELECT COUNT(*) FROM borrowings WHERE book_status = 'borrowed') as active_borrowings,
+              (SELECT COUNT(*) FROM borrowings WHERE book_status = 'borrowed' AND due_date < NOW()) as overdue_borrowings,
+              (SELECT COUNT(*) FROM users WHERE role != 'ADMIN' AND role != 'SADMIN') as total_users,
+              (SELECT COUNT(*) FROM borrowings WHERE request = 'requested') as pending_requests";
 $stats_result = mysqli_query($conn, $stats_sql);
 $stats = mysqli_fetch_assoc($stats_result);
 
@@ -384,15 +508,15 @@ $top_borrowers_result = mysqli_query($conn, $top_borrowers_sql);
 if ($is_sadmin) {
     // SADMIN can see all users including admins
     $users_sql = "SELECT u.id, u.username, u.email, u.allowed, u.role,
-                 (SELECT COUNT(*) FROM borrowings WHERE user_id = u.id AND status = 'borrowed') as active_borrows,
-                 (SELECT COUNT(*) FROM borrowings WHERE user_id = u.id AND status = 'borrowed' AND due_date < NOW()) as overdue_borrows
+                 (SELECT COUNT(*) FROM borrowings WHERE user_id = u.id AND book_status = 'borrowed') as active_borrows,
+                 (SELECT COUNT(*) FROM borrowings WHERE user_id = u.id AND book_status = 'borrowed' AND due_date < NOW()) as overdue_borrows
                  FROM users u
                  ORDER BY username";
 } else {
     // Regular ADMIN can only see regular users
     $users_sql = "SELECT u.id, u.username, u.email, u.allowed, u.role,
-                 (SELECT COUNT(*) FROM borrowings WHERE user_id = u.id AND status = 'borrowed') as active_borrows,
-                 (SELECT COUNT(*) FROM borrowings WHERE user_id = u.id AND status = 'borrowed' AND due_date < NOW()) as overdue_borrows
+                 (SELECT COUNT(*) FROM borrowings WHERE user_id = u.id AND book_status = 'borrowed') as active_borrows,
+                 (SELECT COUNT(*) FROM borrowings WHERE user_id = u.id AND book_status = 'borrowed' AND due_date < NOW()) as overdue_borrows
                  FROM users u
                  WHERE u.role != 'ADMIN' AND u.role != 'SADMIN'
                  ORDER BY username";
@@ -426,6 +550,8 @@ $popular_books_result = mysqli_query($conn, $popular_books_sql);
                 <a href="#" class="nav-link tab-link" onclick="openTab('borrowings')">Borrowings</a>
                 <a href="#" class="nav-link tab-link" onclick="openTab('users')">Users</a>
                 <a href="#" class="nav-link tab-link" onclick="openTab('reports')">Reports</a>
+                <a href="#" class="nav-link tab-link" onclick="openTab('requests')">Requests</a>
+
                 <?php if ($is_sadmin): ?>
                 <a href="#" class="nav-link tab-link" onclick="openTab('admins')">Manage Admins</a>
                 <?php endif; ?>
@@ -436,6 +562,10 @@ $popular_books_result = mysqli_query($conn, $popular_books_sql);
         
         <!-- Dashboard Statistics -->
         <div class="dashboard-grid">
+            <div class="stat-card">
+                <h3>Pending Requests</h3>
+                <div class="number"><?php echo $stats['pending_requests']; ?></div>
+            </div>
             <div class="stat-card">
                 <h3>Total Books</h3>
                 <div class="number"><?php echo $stats['total_books']; ?></div>
@@ -461,6 +591,7 @@ $popular_books_result = mysqli_query($conn, $popular_books_sql);
                 <div class="number"><?php echo $stats['total_users']; ?></div>
             </div>
         </div>
+
         
         <!-- Tab Content -->
         <div class="section tab-content" id="books-tab">
@@ -501,10 +632,15 @@ $popular_books_result = mysqli_query($conn, $popular_books_sql);
                             <td><?php echo htmlspecialchars($book['isbn'] ?? 'N/A'); ?></td>
                             <td><?php echo htmlspecialchars($book['publication_year'] ?? 'N/A'); ?></td>
                             <td>
-                                <button class="btn btn-primary" onclick="openUpdateModal(<?php echo $book['book_id']; ?>)">Update</button>
-                                <form method="post" style="display: inline;">
-                                    <input type="hidden" name="book_id" value="<?php echo $book['book_id']; ?>">
-                                    <button type="submit" name="delete_book" class="btn btn-danger" onclick="return confirm('Are you sure you want to delete this book?')">Delete</button>
+                            <button class="btn btn-primary" onclick="openUpdateModal(
+                        <?php echo $book['book_id']; ?>, 
+                        '<?php echo addslashes(htmlspecialchars($book['title'])); ?>', 
+                        '<?php echo addslashes(htmlspecialchars($book['author'])); ?>', 
+                        '<?php echo addslashes(htmlspecialchars($book['category'])); ?>', 
+                        '<?php echo addslashes(htmlspecialchars($book['isbn'] ?? '')); ?>', 
+                        '<?php echo addslashes(htmlspecialchars($book['publication_year'] ?? '')); ?>',
+                        '<?php echo isset($book['cover_image']) && $book['cover_image'] ? htmlspecialchars($book['cover_image']) : ''; ?>'
+                    )">Update</button>
                                 </form>
                             </td>
                         </tr>
@@ -831,21 +967,72 @@ $popular_books_result = mysqli_query($conn, $popular_books_sql);
             </div>
         </div>
         
-        <!-- Update Copies Modal -->
-        <div id="updateModal" class="modal">
-            <div class="modal-content">
-                <span class="close" onclick="closeModal('updateModal')">&times;</span>
-                <h2>Update Book Copies</h2>
-                <form method="post">
-                    <input type="hidden" id="update_book_id" name="book_id">
-                    <div class="form-group">
-                        <label for="additional_copies">Add/Remove Copies (use negative numbers to remove):</label>
-                        <input type="number" id="additional_copies" name="additional_copies" class="form-control" required>
-                    </div>
-                    <button type="submit" name="update_copies" class="btn btn-primary">Update Copies</button>
-                </form>
+        <!-- Update Book Modal -->
+<div id="updateModal" class="modal">
+    <div class="modal-content">
+        <span class="close" onclick="closeModal('updateModal')">&times;</span>
+        <h2>Update Book</h2>
+        <form method="post" enctype="multipart/form-data">
+            <input type="hidden" id="update_book_id" name="book_id">
+            
+            <div class="form-grid">
+                <div class="form-group">
+                    <label for="update_title">Title:</label>
+                    <input type="text" id="update_title" name="title" class="form-control" required>
+                </div>
+                <div class="form-group">
+                    <label for="update_author">Author:</label>
+                    <input type="text" id="update_author" name="author" class="form-control" required>
+                </div>
             </div>
-        </div>
+            
+            <div class="form-grid">
+                <div class="form-group">
+                    <label for="update_category">Category:</label>
+                    <select id="update_category" name="category" class="form-control" required>
+                        <option value="Fiction">Fiction</option>
+                        <option value="Non-Fiction">Non-Fiction</option>
+                        <option value="Science Fiction">Science Fiction</option>
+                        <option value="Mystery">Mystery</option>
+                        <option value="Romance">Romance</option>
+                        <option value="Biography">Biography</option>
+                        <option value="History">History</option>
+                        <option value="Self-Help">Self-Help</option>
+                        <option value="Reference">Reference</option>
+                        <option value="Textbook">Textbook</option>
+                        <option value="Children">Children</option>
+                        <option value="Other">Other</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="additional_copies">Add/Remove Copies:</label>
+                    <input type="number" id="additional_copies" name="additional_copies" class="form-control" value="0">
+                    <small>Use negative numbers to remove copies</small>
+                </div>
+            </div>
+            
+            <div class="form-grid">
+                <div class="form-group">
+                    <label for="update_isbn">ISBN:</label>
+                    <input type="text" id="update_isbn" name="isbn" class="form-control">
+                </div>
+                <div class="form-group">
+                    <label for="update_published_year">Publication Year:</label>
+                    <input type="number" id="update_published_year" name="published_year" class="form-control" min="1800" max="<?php echo date('Y'); ?>">
+                </div>
+            </div>
+            
+            <div class="form-group">
+                <label for="update_book_cover">Book Cover:</label>
+                <input type="file" id="update_book_cover" name="book_cover" class="form-control" accept="image/*" onchange="previewUpdateImage(this)">
+                <img id="updateCoverPreview" class="cover-preview">
+                <small>Leave empty to keep current image</small>
+            </div>
+            
+            <button type="submit" name="update_book" class="btn btn-primary">Update Book</button>
+        </form>
+    </div>
+</div>
         
         <!-- Update User Limit Modal -->
         <div id="updateLimitModal" class="modal">
