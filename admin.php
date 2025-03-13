@@ -9,8 +9,9 @@ if (!isset($_SESSION['user_id']) || !isset($_SESSION['role']) || ($_SESSION['rol
 }
 
 $conn = get_db_connection();
+$is_sadmin = ($_SESSION['role'] == 'SADMIN');
 
-// Handle book addition
+// Handle book addition with image upload
 if (isset($_POST['add_book'])) {
     $title = $_POST['title'];
     $author = $_POST['author'];
@@ -19,10 +20,43 @@ if (isset($_POST['add_book'])) {
     $isbn = $_POST['isbn'];
     $published_year = $_POST['published_year'];
     
-    $add_sql = "INSERT INTO library (title, author, category, total_copies, available_copies, isbn, publication_year) 
-                VALUES (?, ?, ?, ?, ?, ?, ?)";
+    // Process image upload if present
+    $cover_image_path = NULL;
+    if (isset($_FILES['book_cover']) && $_FILES['book_cover']['error'] == 0) {
+        $upload_dir = 'uploads/book_covers/';
+        $filename = time() . '_' . basename($_FILES['book_cover']['name']);
+        $target_file = $upload_dir . $filename;
+        
+        // Check if image file is an actual image
+        $check = getimagesize($_FILES['book_cover']['tmp_name']);
+        if ($check !== false) {
+            // Check file size (limit to 5MB)
+            if ($_FILES['book_cover']['size'] < 5000000) {
+                // Check file type
+                $file_type = strtolower(pathinfo($target_file, PATHINFO_EXTENSION));
+                if (in_array($file_type, ['jpg', 'jpeg', 'png', 'gif'])) {
+                    // Try to upload file
+                    if (move_uploaded_file($_FILES['book_cover']['tmp_name'], $target_file)) {
+                        $cover_image_path = $target_file;
+                    } else {
+                        echo "<script>alert('Sorry, there was an error uploading your file.');</script>";
+                    }
+                } else {
+                    echo "<script>alert('Sorry, only JPG, JPEG, PNG & GIF files are allowed.');</script>";
+                }
+            } else {
+                echo "<script>alert('Sorry, your file is too large. Max size is 5MB.');</script>";
+            }
+        } else {
+            echo "<script>alert('File is not an image.');</script>";
+        }
+    }
+    
+    // Insert book with image path if available
+    $add_sql = "INSERT INTO library (title, author, category, total_copies, available_copies, isbn, publication_year, cover_image) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
     $add_stmt = mysqli_prepare($conn, $add_sql);
-    mysqli_stmt_bind_param($add_stmt, "sssiisi", $title, $author, $category, $copies, $copies, $isbn, $published_year);
+    mysqli_stmt_bind_param($add_stmt, "sssiisis", $title, $author, $category, $copies, $copies, $isbn, $published_year, $cover_image_path);
     
     if (mysqli_stmt_execute($add_stmt)) {
         echo "<script>alert('Book added successfully!');</script>";
@@ -30,6 +64,108 @@ if (isset($_POST['add_book'])) {
         echo "<script>alert('Error adding book: " . mysqli_error($conn) . "');</script>";
     }
 }
+
+// Handle book update
+if (isset($_POST['update_book'])) {
+    $book_id = $_POST['book_id'];
+    $title = $_POST['title'];
+    $author = $_POST['author'];
+    $category = $_POST['category'];
+    $isbn = $_POST['isbn'];
+    $published_year = $_POST['published_year'];
+    $additional_copies = $_POST['additional_copies'];
+    
+    // Begin transaction
+    mysqli_begin_transaction($conn);
+    
+    try {
+        // Process image upload if present
+        $cover_image_sql = "";
+        $cover_image_param = "";
+        
+        if (isset($_FILES['book_cover']) && $_FILES['book_cover']['error'] == 0) {
+            $upload_dir = 'uploads/book_covers/';
+            $filename = time() . '_' . basename($_FILES['book_cover']['name']);
+            $target_file = $upload_dir . $filename;
+            
+            // Check if image file is an actual image
+            $check = getimagesize($_FILES['book_cover']['tmp_name']);
+            if ($check !== false) {
+                // Check file size (limit to 5MB)
+                if ($_FILES['book_cover']['size'] < 5000000) {
+                    // Check file type
+                    $file_type = strtolower(pathinfo($target_file, PATHINFO_EXTENSION));
+                    if (in_array($file_type, ['jpg', 'jpeg', 'png', 'gif'])) {
+                        // Try to upload file
+                        if (move_uploaded_file($_FILES['book_cover']['tmp_name'], $target_file)) {
+                            // Get old image path to delete later
+                            $get_old_image_sql = "SELECT cover_image FROM library WHERE book_id = ?";
+                            $get_old_image_stmt = mysqli_prepare($conn, $get_old_image_sql);
+                            mysqli_stmt_bind_param($get_old_image_stmt, "i", $book_id);
+                            mysqli_stmt_execute($get_old_image_stmt);
+                            $old_image_result = mysqli_stmt_get_result($get_old_image_stmt);
+                            $old_image_row = mysqli_fetch_assoc($old_image_result);
+                            $old_image_path = $old_image_row['cover_image'];
+                            
+                            // Set new image path
+                            $cover_image_sql = ", cover_image = ?";
+                            $cover_image_param = $target_file;
+                            
+                            // Delete old file if exists
+                            if ($old_image_path && file_exists($old_image_path)) {
+                                unlink($old_image_path);
+                            }
+                        } else {
+                            throw new Exception("Error uploading file");
+                        }
+                    } else {
+                        throw new Exception("Only JPG, JPEG, PNG & GIF files are allowed");
+                    }
+                } else {
+                    throw new Exception("File is too large (max 5MB)");
+                }
+            } else {
+                throw new Exception("File is not an image");
+            }
+        }
+        
+        // Update book info
+        $update_sql = "UPDATE library SET 
+                       title = ?, 
+                       author = ?, 
+                       category = ?, 
+                       isbn = ?, 
+                       publication_year = ?,
+                       total_copies = total_copies + ?, 
+                       available_copies = available_copies + ?
+                       $cover_image_sql 
+                       WHERE book_id = ?";
+        
+        $update_stmt = mysqli_prepare($conn, $update_sql);
+        
+        if ($cover_image_sql) {
+            mysqli_stmt_bind_param($update_stmt, "ssssiisi", 
+                $title, $author, $category, $isbn, $published_year, 
+                $additional_copies, $additional_copies, $cover_image_param, $book_id);
+        } else {
+            mysqli_stmt_bind_param($update_stmt, "ssssiiii", 
+                $title, $author, $category, $isbn, $published_year, 
+                $additional_copies, $additional_copies, $book_id);
+        }
+        
+        if (mysqli_stmt_execute($update_stmt)) {
+            mysqli_commit($conn);
+            echo "<script>alert('Book updated successfully!');</script>";
+        } else {
+            throw new Exception(mysqli_error($conn));
+        }
+    } catch (Exception $e) {
+        mysqli_rollback($conn);
+        echo "<script>alert('Error updating book: " . $e->getMessage() . "');</script>";
+    }
+}
+
+
 
 // Handle book deletion
 if (isset($_POST['delete_book'])) {
@@ -93,6 +229,43 @@ if (isset($_POST['update_user_limit'])) {
     }
 }
 
+// Handle book return
+if (isset($_POST['return_book'])) {
+    $borrow_id = $_POST['borrow_id'];
+    $book_id = $_POST['book_id'];
+    
+    // Begin transaction
+    mysqli_begin_transaction($conn);
+    
+    try {
+        // Update borrowing status
+        $update_borrow_sql = "UPDATE borrowings SET status = 'returned', return_date = NOW() WHERE borrow_id = ?";
+        $update_borrow_stmt = mysqli_prepare($conn, $update_borrow_sql);
+        mysqli_stmt_bind_param($update_borrow_stmt, "i", $borrow_id);
+        mysqli_stmt_execute($update_borrow_stmt);
+        
+        // Increment available copies in library
+        $update_lib_sql = "UPDATE library SET available_copies = available_copies + 1 WHERE book_id = ?";
+        $update_lib_stmt = mysqli_prepare($conn, $update_lib_sql);
+        mysqli_stmt_bind_param($update_lib_stmt, "i", $book_id);
+        mysqli_stmt_execute($update_lib_stmt);
+
+        // Increment allowed books for the user
+        $increment_sql = "UPDATE users SET allowed = allowed + 1 WHERE id = ?";
+        $increment_stmt = mysqli_prepare($conn, $increment_sql);
+        mysqli_stmt_bind_param($increment_stmt, "i", $user_id);
+        mysqli_stmt_execute($increment_stmt);
+        
+        // Commit transaction
+        mysqli_commit($conn);
+        echo "<script>alert('Book returned successfully!');</script>";
+    } catch (Exception $e) {
+        // Rollback transaction on error
+        mysqli_rollback($conn);
+        echo "<script>alert('Error returning book: " . $e->getMessage() . "');</script>";
+    }
+}
+
 // Send overdue notice
 if (isset($_POST['send_notice'])) {
     $borrow_id = $_POST['borrow_id'];
@@ -111,12 +284,66 @@ if (isset($_POST['send_notice'])) {
     }
 }
 
+// Create new admin (SADMIN only)
+if (isset($_POST['create_admin']) && $is_sadmin) {
+    $username = $_POST['admin_username'];
+    $email = $_POST['admin_email'];
+    $password = $_POST['admin_password'];
+    $role = $_POST['admin_role'];
+    
+    // Hash password
+    $hashed_password = password_hash($password, PASSWORD_DEFAULT);
+    
+    $create_sql = "INSERT INTO users (username, email, password, role, allowed) VALUES (?, ?, ?, ?, 5)";
+    $create_stmt = mysqli_prepare($conn, $create_sql);
+    mysqli_stmt_bind_param($create_stmt, "ssss", $username, $email, $hashed_password, $role);
+    
+    if (mysqli_stmt_execute($create_stmt)) {
+        echo "<script>alert('New admin created successfully!'); window.location.href='admin.php';</script>";
+    } else {
+        echo "<script>alert('Error creating admin: " . mysqli_error($conn) . "');</script>";
+    }
+}
+
+// Handle admin removal (SADMIN only)
+if (isset($_POST['remove_admin']) && $is_sadmin) {
+    $user_id = $_POST['user_id'];
+    
+    // Check that user is not removing themselves
+    if ($user_id == $_SESSION['user_id']) {
+        echo "<script>alert('You cannot remove yourself!');</script>";
+    } else {
+        // Get the user's role first to confirm they're an admin
+        $check_sql = "SELECT role FROM users WHERE id = ?";
+        $check_stmt = mysqli_prepare($conn, $check_sql);
+        mysqli_stmt_bind_param($check_stmt, "i", $user_id);
+        mysqli_stmt_execute($check_stmt);
+        $result = mysqli_stmt_get_result($check_stmt);
+        $row = mysqli_fetch_assoc($result);
+        
+        // Only proceed if user is an admin or super admin
+        if ($row && ($row['role'] == 'ADMIN' || $row['role'] == 'SADMIN')) {
+            $delete_sql = "DELETE FROM users WHERE id = ?";
+            $delete_stmt = mysqli_prepare($conn, $delete_sql);
+            mysqli_stmt_bind_param($delete_stmt, "i", $user_id);
+            
+            if (mysqli_stmt_execute($delete_stmt)) {
+                echo "<script>alert('Admin removed successfully!');</script>";
+            } else {
+                echo "<script>alert('Error removing admin: " . mysqli_error($conn) . "');</script>";
+            }
+        } else {
+            echo "<script>alert('Invalid user or not an admin account!');</script>";
+        }
+    }
+}
+
 // Get all books
 $books_sql = "SELECT * FROM library ORDER BY title";
 $books_result = mysqli_query($conn, $books_sql);
 
 // Get all active borrowings
-$borrowings_sql = "SELECT b.*, l.title, l.author, u.username, u.email 
+$borrowings_sql = "SELECT b.*, l.title, l.author, l.book_id, u.username, u.email 
                   FROM borrowings b 
                   JOIN library l ON b.book_id = l.book_id 
                   JOIN users u ON b.user_id = u.id 
@@ -125,7 +352,7 @@ $borrowings_sql = "SELECT b.*, l.title, l.author, u.username, u.email
 $borrowings_result = mysqli_query($conn, $borrowings_sql);
 
 // Get overdue books
-$overdue_sql = "SELECT b.*, l.title, l.author, u.username, u.email 
+$overdue_sql = "SELECT b.*, l.title, l.author, l.book_id, u.username, u.email 
                FROM borrowings b 
                JOIN library l ON b.book_id = l.book_id 
                JOIN users u ON b.user_id = u.id 
@@ -153,13 +380,23 @@ $top_borrowers_sql = "SELECT u.username, u.email, COUNT(*) as borrow_count
                      LIMIT 5";
 $top_borrowers_result = mysqli_query($conn, $top_borrowers_sql);
 
-// Get users with books
-$users_sql = "SELECT u.id, u.username, u.email, u.allowed,
-             (SELECT COUNT(*) FROM borrowings WHERE user_id = u.id AND status = 'borrowed') as active_borrows,
-             (SELECT COUNT(*) FROM borrowings WHERE user_id = u.id AND status = 'borrowed' AND due_date < NOW()) as overdue_borrows
-             FROM users u
-             WHERE u.role != 'ADMIN' AND u.role != 'SADMIN'
-             ORDER BY username";
+// Get users - different queries for SADMIN and regular ADMIN
+if ($is_sadmin) {
+    // SADMIN can see all users including admins
+    $users_sql = "SELECT u.id, u.username, u.email, u.allowed, u.role,
+                 (SELECT COUNT(*) FROM borrowings WHERE user_id = u.id AND status = 'borrowed') as active_borrows,
+                 (SELECT COUNT(*) FROM borrowings WHERE user_id = u.id AND status = 'borrowed' AND due_date < NOW()) as overdue_borrows
+                 FROM users u
+                 ORDER BY username";
+} else {
+    // Regular ADMIN can only see regular users
+    $users_sql = "SELECT u.id, u.username, u.email, u.allowed, u.role,
+                 (SELECT COUNT(*) FROM borrowings WHERE user_id = u.id AND status = 'borrowed') as active_borrows,
+                 (SELECT COUNT(*) FROM borrowings WHERE user_id = u.id AND status = 'borrowed' AND due_date < NOW()) as overdue_borrows
+                 FROM users u
+                 WHERE u.role != 'ADMIN' AND u.role != 'SADMIN'
+                 ORDER BY username";
+}
 $users_result = mysqli_query($conn, $users_sql);
 
 // Get popular books
@@ -177,381 +414,21 @@ $popular_books_result = mysqli_query($conn, $popular_books_sql);
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Library Admin Dashboard</title>
-    <style>
-        /* Reset and base styles */
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
-        body {
-            font-family: 'Arial', sans-serif;
-            line-height: 1.6;
-            background-color: #f0f2f5;
-            color: #333;
-        }
-
-        .container {
-            max-width: 1300px;
-            margin: 0 auto;
-            padding: 20px;
-        }
-
-        /* Header styles */
-        .header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 30px;
-            padding: 20px 0;
-            border-bottom: 2px solid #ddd;
-        }
-
-        .header h1 {
-            color: #2c3e50;
-            font-size: 24px;
-        }
-
-        .nav-links {
-            display: flex;
-            gap: 20px;
-        }
-
-        .nav-link {
-            text-decoration: none;
-            color: #3498db;
-            font-weight: 500;
-            transition: color 0.3s;
-        }
-
-        .nav-link:hover {
-            color: #2980b9;
-        }
-
-        .logout {
-            background-color: #e74c3c;
-            color: white;
-            padding: 8px 16px;
-            border-radius: 4px;
-            text-decoration: none;
-            transition: background-color 0.3s;
-        }
-
-        .logout:hover {
-            background-color: #c0392b;
-        }
-
-        /* Dashboard grid layout */
-        .dashboard-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 20px;
-            margin-bottom: 30px;
-        }
-
-        .stat-card {
-            background-color: white;
-            border-radius: 8px;
-            padding: 20px;
-            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            text-align: center;
-        }
-
-        .stat-card h3 {
-            color: #7f8c8d;
-            font-size: 16px;
-            margin-bottom: 10px;
-        }
-
-        .stat-card .number {
-            font-size: 36px;
-            font-weight: 700;
-            color: #2c3e50;
-        }
-
-        /* Section styles */
-        .section {
-            background-color: white;
-            border-radius: 8px;
-            padding: 20px;
-            margin-bottom: 30px;
-            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-        }
-
-        .section-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 20px;
-        }
-
-        .section h2 {
-            color: #2c3e50;
-            font-size: 20px;
-        }
-
-        /* Table styles */
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-bottom: 20px;
-        }
-
-        th, td {
-            padding: 12px;
-            text-align: left;
-            border-bottom: 1px solid #eee;
-        }
-
-        th {
-            background-color: #f8f9fa;
-            font-weight: 600;
-            color: #2c3e50;
-        }
-
-        tr:hover {
-            background-color: #f8f9fa;
-        }
-
-        /* Button styles */
-        .btn {
-            padding: 8px 16px;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            font-weight: 500;
-            transition: background-color 0.3s;
-        }
-
-        .btn-primary {
-            background-color: #3498db;
-            color: white;
-        }
-
-        .btn-primary:hover {
-            background-color: #2980b9;
-        }
-
-        .btn-success {
-            background-color: #2ecc71;
-            color: white;
-        }
-
-        .btn-success:hover {
-            background-color: #27ae60;
-        }
-
-        .btn-danger {
-            background-color: #e74c3c;
-            color: white;
-        }
-
-        .btn-danger:hover {
-            background-color: #c0392b;
-        }
-
-        .btn-warning {
-            background-color: #f39c12;
-            color: white;
-        }
-
-        .btn-warning:hover {
-            background-color: #d35400;
-        }
-
-        /* Status indicators */
-        .status {
-            padding: 4px 8px;
-            border-radius: 4px;
-            font-size: 14px;
-            font-weight: 500;
-        }
-
-        .status-borrowed {
-            background-color: #f1c40f;
-            color: #444;
-        }
-
-        .status-overdue {
-            background-color: #e74c3c;
-            color: white;
-        }
-
-        .status-returned {
-            background-color: #2ecc71;
-            color: white;
-        }
-
-        /* Form styles */
-        .form-group {
-            margin-bottom: 15px;
-        }
-
-        .form-group label {
-            display: block;
-            margin-bottom: 5px;
-            font-weight: 500;
-        }
-
-        .form-control {
-            width: 100%;
-            padding: 8px 12px;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            font-size: 16px;
-        }
-
-        .form-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 15px;
-        }
-
-        /* Modal styles */
-        .modal {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background-color: rgba(0, 0, 0, 0.5);
-            z-index: 1000;
-            overflow: auto;
-        }
-
-        .modal-content {
-            background-color: white;
-            margin: 10% auto;
-            padding: 20px;
-            border-radius: 8px;
-            width: 60%;
-            max-width: 600px;
-            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
-        }
-
-        .close {
-            color: #aaa;
-            float: right;
-            font-size: 28px;
-            font-weight: bold;
-            cursor: pointer;
-        }
-
-        .close:hover {
-            color: #333;
-        }
-
-        /* Tabs */
-        .tabs {
-            display: flex;
-            margin-bottom: 20px;
-            border-bottom: 1px solid #ddd;
-        }
-
-        .tab {
-            padding: 10px 20px;
-            cursor: pointer;
-            transition: background-color 0.3s;
-            border-radius: 4px 4px 0 0;
-        }
-
-        .tab.active {
-            background-color: #3498db;
-            color: white;
-            border-bottom: 3px solid #2980b9;
-        }
-
-        .tab:hover:not(.active) {
-            background-color: #f5f5f5;
-        }
-
-        .tab-content {
-            display: none;
-        }
-
-        .tab-content.active {
-            display: block;
-        }
-
-        /* Responsive design */
-        @media (max-width: 768px) {
-            .container {
-                padding: 10px;
-            }
-            
-            .dashboard-grid {
-                grid-template-columns: 1fr;
-            }
-            
-            table {
-                display: block;
-                overflow-x: auto;
-                white-space: nowrap;
-            }
-            
-            th, td {
-                padding: 8px;
-            }
-            
-            .header {
-                flex-direction: column;
-                text-align: center;
-                gap: 10px;
-            }
-            
-            .modal-content {
-                width: 90%;
-            }
-            
-            .form-grid {
-                grid-template-columns: 1fr;
-            }
-        }
-        
-        /* Additional utility classes */
-        .text-center {
-            text-align: center;
-        }
-        
-        .text-right {
-            text-align: right;
-        }
-        
-        .mt-20 {
-            margin-top: 20px;
-        }
-        
-        .mb-20 {
-            margin-bottom: 20px;
-        }
-        
-        .d-flex {
-            display: flex;
-        }
-        
-        .justify-between {
-            justify-content: space-between;
-        }
-        
-        .align-center {
-            align-items: center;
-        }
-    </style>
+    <link rel="stylesheet" href="admin.css">
+    <script src="admin.js"></script>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>Library Admin Dashboard</h1>
+            <h1>Library Admin Dashboard <?php echo $is_sadmin ? '(Super Admin)' : '(Admin)'; ?></h1>
             <div class="nav-links">
                 <a href="#" class="nav-link tab-link" onclick="openTab('books')">Books</a>
                 <a href="#" class="nav-link tab-link" onclick="openTab('borrowings')">Borrowings</a>
                 <a href="#" class="nav-link tab-link" onclick="openTab('users')">Users</a>
                 <a href="#" class="nav-link tab-link" onclick="openTab('reports')">Reports</a>
+                <?php if ($is_sadmin): ?>
+                <a href="#" class="nav-link tab-link" onclick="openTab('admins')">Manage Admins</a>
+                <?php endif; ?>
                 <a href="dashboard.php" class="nav-link">User View</a>
                 <a href="logout.php" class="logout">Logout</a>
             </div>
@@ -595,7 +472,8 @@ $popular_books_result = mysqli_query($conn, $popular_books_sql);
             <table>
                 <thead>
                     <tr>
-                        <th>ID</th>
+                        <th>#</th>
+                        <th>Cover</th>
                         <th>Title</th>
                         <th>Author</th>
                         <th>Category</th>
@@ -606,15 +484,22 @@ $popular_books_result = mysqli_query($conn, $popular_books_sql);
                     </tr>
                 </thead>
                 <tbody>
-                    <?php while ($book = mysqli_fetch_assoc($books_result)): ?>
+                    <?php $book_count = 1; while ($book = mysqli_fetch_assoc($books_result)): ?>
                         <tr>
-                            <td><?php echo $book['book_id']; ?></td>
+                            <td><?php echo $book_count++; ?></td>
+                            <td>
+                                <?php if (isset($book['cover_image']) && $book['cover_image']): ?>
+                                    <img src="<?php echo htmlspecialchars($book['cover_image']); ?>" alt="Book cover" class="book-cover-preview">
+                                <?php else: ?>
+                                    <img src="images/book_covers/default.jpg" alt="Default cover" class="book-cover-preview">
+                                <?php endif; ?>
+                            </td>
                             <td><?php echo htmlspecialchars($book['title']); ?></td>
                             <td><?php echo htmlspecialchars($book['author']); ?></td>
                             <td><?php echo htmlspecialchars($book['category']); ?></td>
                             <td><?php echo $book['available_copies']; ?> / <?php echo $book['total_copies']; ?></td>
                             <td><?php echo htmlspecialchars($book['isbn'] ?? 'N/A'); ?></td>
-                            <td><?php echo htmlspecialchars($book['published_year'] ?? 'N/A'); ?></td>
+                            <td><?php echo htmlspecialchars($book['publication_year'] ?? 'N/A'); ?></td>
                             <td>
                                 <button class="btn btn-primary" onclick="openUpdateModal(<?php echo $book['book_id']; ?>)">Update</button>
                                 <form method="post" style="display: inline;">
@@ -636,7 +521,7 @@ $popular_books_result = mysqli_query($conn, $popular_books_sql);
             <table>
                 <thead>
                     <tr>
-                        <th>ID</th>
+                        <th>#</th>
                         <th>Book Title</th>
                         <th>Borrowed By</th>
                         <th>Email</th>
@@ -647,9 +532,9 @@ $popular_books_result = mysqli_query($conn, $popular_books_sql);
                     </tr>
                 </thead>
                 <tbody>
-                    <?php while ($borrowing = mysqli_fetch_assoc($borrowings_result)): ?>
+                    <?php $borrow_count = 1; while ($borrowing = mysqli_fetch_assoc($borrowings_result)): ?>
                         <tr>
-                            <td><?php echo $borrowing['borrow_id']; ?></td>
+                            <td><?php echo $borrow_count++; ?></td>
                             <td><?php echo htmlspecialchars($borrowing['title']); ?></td>
                             <td><?php echo htmlspecialchars($borrowing['username']); ?></td>
                             <td><?php echo htmlspecialchars($borrowing['email']); ?></td>
@@ -661,14 +546,18 @@ $popular_books_result = mysqli_query($conn, $popular_books_sql);
                                 </span>
                             </td>
                             <td>
+                                <form method="post" style="display: inline;">
+                                    <input type="hidden" name="borrow_id" value="<?php echo $borrowing['borrow_id']; ?>">
+                                    <input type="hidden" name="book_id" value="<?php echo $borrowing['book_id']; ?>">
+                                    <button type="submit" name="return_book" class="btn btn-success" onclick="return confirm('Mark this book as returned?')">Return Book</button>
+                                </form>
+                                
                                 <?php if (strtotime($borrowing['due_date']) < time() && !$borrowing['notice_sent']): ?>
-                                    <form method="post" style="display: inline;">
+                                    <form method="post" style="display: inline; margin-left: 5px;">
                                         <input type="hidden" name="borrow_id" value="<?php echo $borrowing['borrow_id']; ?>">
                                         <input type="hidden" name="user_id" value="<?php echo $borrowing['user_id']; ?>">
                                         <button type="submit" name="send_notice" class="btn btn-warning">Send Notice</button>
                                     </form>
-                                <?php elseif (strtotime($borrowing['due_date']) < time() && $borrowing['notice_sent']): ?>
-                                    <span class="status">Notice Sent</span>
                                 <?php endif; ?>
                             </td>
                         </tr>
@@ -683,37 +572,55 @@ $popular_books_result = mysqli_query($conn, $popular_books_sql);
             <table>
                 <thead>
                     <tr>
-                        <th>ID</th>
+                        <th>#</th>
                         <th>Book Title</th>
                         <th>Borrowed By</th>
                         <th>Email</th>
+                        <th>Borrow Date</th>
                         <th>Due Date</th>
                         <th>Days Overdue</th>
                         <th>Actions</th>
                     </tr>
                 </thead>
                 <tbody>
-                    <?php while ($overdue = mysqli_fetch_assoc($overdue_result)): ?>
+                    <?php 
+                    $overdue_count = 1; 
+                    if (mysqli_num_rows($overdue_result) > 0):
+                        while ($overdue = mysqli_fetch_assoc($overdue_result)): 
+                            $days_overdue = floor((time() - strtotime($overdue['due_date'])) / (60 * 60 * 24));
+                    ?>
                         <tr>
-                            <td><?php echo $overdue['borrow_id']; ?></td>
+                            <td><?php echo $overdue_count++; ?></td>
                             <td><?php echo htmlspecialchars($overdue['title']); ?></td>
                             <td><?php echo htmlspecialchars($overdue['username']); ?></td>
                             <td><?php echo htmlspecialchars($overdue['email']); ?></td>
+                            <td><?php echo date('Y-m-d', strtotime($overdue['borrow_date'])); ?></td>
                             <td><?php echo date('Y-m-d', strtotime($overdue['due_date'])); ?></td>
-                            <td><?php echo floor((time() - strtotime($overdue['due_date'])) / 86400); ?></td>
+                            <td><?php echo $days_overdue; ?> days</td>
                             <td>
+                                <form method="post" style="display: inline;">
+                                    <input type="hidden" name="borrow_id" value="<?php echo $overdue['borrow_id']; ?>">
+                                    <input type="hidden" name="book_id" value="<?php echo $overdue['book_id']; ?>">
+                                    <button type="submit" name="return_book" class="btn btn-success" onclick="return confirm('Mark this book as returned?')">Return Book</button>
+                                </form>
+                                
                                 <?php if (!$overdue['notice_sent']): ?>
-                                    <form method="post" style="display: inline;">
+                                    <form method="post" style="display: inline; margin-left: 5px;">
                                         <input type="hidden" name="borrow_id" value="<?php echo $overdue['borrow_id']; ?>">
                                         <input type="hidden" name="user_id" value="<?php echo $overdue['user_id']; ?>">
                                         <button type="submit" name="send_notice" class="btn btn-warning">Send Notice</button>
                                     </form>
-                                <?php else: ?>
-                                    <span class="status">Notice Sent</span>
                                 <?php endif; ?>
                             </td>
                         </tr>
-                    <?php endwhile; ?>
+                    <?php 
+                        endwhile;
+                    else:
+                    ?>
+                        <tr>
+                            <td colspan="8" class="text-center">No overdue books at this time.</td>
+                        </tr>
+                    <?php endif; ?>
                 </tbody>
             </table>
         </div>
@@ -726,32 +633,34 @@ $popular_books_result = mysqli_query($conn, $popular_books_sql);
             <table>
                 <thead>
                     <tr>
-                        <th>ID</th>
+                        <th>#</th>
                         <th>Username</th>
                         <th>Email</th>
-                        <th>Current Books</th>
-                        <th>Limit</th>
+                        <th>Role</th>
+                        <th>Borrow Limit</th>
+                        <th>Active Borrowings</th>
                         <th>Overdue Books</th>
                         <th>Actions</th>
                     </tr>
                 </thead>
                 <tbody>
-                    <?php while ($user = mysqli_fetch_assoc($users_result)): ?>
+                    <?php $user_count = 1; while ($user = mysqli_fetch_assoc($users_result)): ?>
                         <tr>
-                            <td><?php echo $user['id']; ?></td>
+                            <td><?php echo $user_count++; ?></td>
                             <td><?php echo htmlspecialchars($user['username']); ?></td>
                             <td><?php echo htmlspecialchars($user['email']); ?></td>
-                            <td><?php echo $user['active_borrows']; ?> / <?php echo $user['allowed']; ?></td>
-                            <td><?php echo $user['allowed']; ?></td>
                             <td>
-                                <?php if ($user['overdue_borrows'] > 0): ?>
-                                    <span class="status status-overdue"><?php echo $user['overdue_borrows']; ?></span>
-                                <?php else: ?>
-                                    0
-                                <?php endif; ?>
+                                <span class="role-badge <?php echo strtolower('role-' . $user['role']); ?>">
+                                    <?php echo $user['role']; ?>
+                                </span>
                             </td>
+                            <td><?php echo $user['allowed']; ?></td>
+                            <td><?php echo $user['active_borrows']; ?></td>
+                            <td><?php echo $user['overdue_borrows']; ?></td>
                             <td>
-                                <button class="btn btn-primary" onclick="openUserLimitModal(<?php echo $user['id']; ?>, <?php echo $user['allowed']; ?>)">Update Limit</button>
+                                <button class="btn btn-primary" onclick="openUpdateLimitModal(<?php echo $user['id']; ?>, <?php echo $user['allowed']; ?>)">
+                                    Update Limit
+                                </button>
                             </td>
                         </tr>
                     <?php endwhile; ?>
@@ -760,195 +669,241 @@ $popular_books_result = mysqli_query($conn, $popular_books_sql);
         </div>
         
         <div class="section tab-content" id="reports-tab">
-            <div class="section-header">
-                <h2>Reports & Statistics</h2>
-            </div>
-            
-            <div class="dashboard-grid">
-                <div class="section">
-                    <h3>Top Borrowers</h3>
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Username</th>
-                                <th>Email</th>
-                                <th>Borrowings</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <?php while ($borrower = mysqli_fetch_assoc($top_borrowers_result)): ?>
-                                <tr>
-                                    <td><?php echo htmlspecialchars($borrower['username']); ?></td>
-                                    <td><?php echo htmlspecialchars($borrower['email']); ?></td>
-                                    <td><?php echo $borrower['borrow_count']; ?></td>
-                                </tr>
-                            <?php endwhile; ?>
-                        </tbody>
-                    </table>
-                </div>
-                
-                <div class="section">
-                    <h3>Popular Books</h3>
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Title</th>
-                                <th>Author</th>
-                                <th>Borrowings</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <?php while ($popular = mysqli_fetch_assoc($popular_books_result)): ?>
-                                <tr>
-                                    <td><?php echo htmlspecialchars($popular['title']); ?></td>
-                                    <td><?php echo htmlspecialchars($popular['author']); ?></td>
-                                    <td><?php echo $popular['borrow_count']; ?></td>
-                                </tr>
-                            <?php endwhile; ?>
-                        </tbody>
-                    </table>
-                </div>
-            </div>
+    <!-- Remove the tab buttons since we'll show both reports -->
+    
+    <div class="reports-container">
+        <div class="report-box" id="popular-books-tab">
+            <h3>Most Popular Books</h3>
+            <table class="numbered">
+                <thead>
+                    <tr>
+                        <th>#</th>
+                        <th>Title</th>
+                        <th>Author</th>
+                        <th>Times Borrowed</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php while ($popular = mysqli_fetch_assoc($popular_books_result)): ?>
+                        <tr>
+                            <td></td>
+                            <td><?php echo htmlspecialchars($popular['title']); ?></td>
+                            <td><?php echo htmlspecialchars($popular['author']); ?></td>
+                            <td><?php echo $popular['borrow_count']; ?></td>
+                        </tr>
+                    <?php endwhile; ?>
+                </tbody>
+            </table>
         </div>
         
+        <div class="report-box" id="top-borrowers-tab">
+            <h3>Top Borrowers</h3>
+            <table class="numbered">
+                <thead>
+                    <tr>
+                        <th>#</th>
+                        <th>Username</th>
+                        <th>Email</th>
+                        <th>Books Borrowed</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php while ($borrower = mysqli_fetch_assoc($top_borrowers_result)): ?>
+                        <tr>
+                            <td></td>
+                            <td><?php echo htmlspecialchars($borrower['username']); ?></td>
+                            <td><?php echo htmlspecialchars($borrower['email']); ?></td>
+                            <td><?php echo $borrower['borrow_count']; ?></td>
+                        </tr>
+                    <?php endwhile; ?>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+        
+        <?php if ($is_sadmin): ?>
+        <div class="section tab-content" id="admins-tab">
+            <div class="section-header">
+                <h2>Manage Administrators</h2>
+                <button class="btn btn-primary" onclick="openModal('addAdminModal')">Add New Admin</button>
+            </div>
+            
+            <table>
+                <thead>
+                    <tr>
+                        <th>#</th>
+                        <th>Username</th>
+                        <th>Email</th>
+                        <th>Role</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php 
+                    $admin_sql = "SELECT * FROM users WHERE role = 'ADMIN' OR role = 'SADMIN' ORDER BY role DESC, username ASC";
+                    $admin_result = mysqli_query($conn, $admin_sql);
+                    $admin_count = 1;
+                    
+                    while ($admin = mysqli_fetch_assoc($admin_result)): 
+                    ?>
+                        <tr>
+                            <td><?php echo $admin_count++; ?></td>
+                            <td><?php echo htmlspecialchars($admin['username']); ?></td>
+                            <td><?php echo htmlspecialchars($admin['email']); ?></td>
+                            <td>
+                                <span class="role-badge <?php echo strtolower('role-' . $admin['role']); ?>">
+                                    <?php echo $admin['role']; ?>
+                                </span>
+                            </td>
+                            <td>
+                                <?php if ($admin['id'] != $_SESSION['user_id']): // Cannot modify self ?>
+                                    <form method="post" style="display: inline;" onsubmit="return confirm('Are you sure you want to remove this admin?');">
+                                        <input type="hidden" name="user_id" value="<?php echo $admin['id']; ?>">
+                                        <button type="submit" name="remove_admin" class="btn btn-danger">Remove</button>
+                                    </form>
+                                <?php endif; ?>
+                            </td>
+                        </tr>
+                    <?php endwhile; ?>
+                </tbody>
+            </table>
+        </div>
+        <?php endif; ?>
+        
         <!-- Modals -->
+        <!-- Add Book Modal -->
         <div id="addBookModal" class="modal">
             <div class="modal-content">
                 <span class="close" onclick="closeModal('addBookModal')">&times;</span>
                 <h2>Add New Book</h2>
-                <form method="post">
+                <form method="post" enctype="multipart/form-data">
                     <div class="form-grid">
                         <div class="form-group">
-                            <label for="title">Title</label>
+                            <label for="title">Title:</label>
                             <input type="text" id="title" name="title" class="form-control" required>
                         </div>
                         <div class="form-group">
-                            <label for="author">Author</label>
+                            <label for="author">Author:</label>
                             <input type="text" id="author" name="author" class="form-control" required>
                         </div>
+                    </div>
+                    <div class="form-grid">
                         <div class="form-group">
-                            <label for="category">Category</label>
-                            <input type="text" id="category" name="category" class="form-control" required>
+                            <label for="category">Category:</label>
+                            <select id="category" name="category" class="form-control" required>
+                                <option value="Fiction">Fiction</option>
+                                <option value="Non-Fiction">Non-Fiction</option>
+                                <option value="Science Fiction">Science Fiction</option>
+                                <option value="Mystery">Mystery</option>
+                                <option value="Romance">Romance</option>
+                                <option value="Biography">Biography</option>
+                                <option value="History">History</option>
+                                <option value="Self-Help">Self-Help</option>
+                                <option value="Reference">Reference</option>
+                                <option value="Textbook">Textbook</option>
+                                <option value="Children">Children</option>
+                                <option value="Other">Other</option>
+                            </select>
                         </div>
                         <div class="form-group">
-                            <label for="copies">Number of Copies</label>
+                            <label for="copies">Number of Copies:</label>
                             <input type="number" id="copies" name="copies" class="form-control" min="1" value="1" required>
                         </div>
+                    </div>
+                    <div class="form-grid">
                         <div class="form-group">
-                            <label for="isbn">ISBN</label>
+                            <label for="isbn">ISBN (optional):</label>
                             <input type="text" id="isbn" name="isbn" class="form-control">
                         </div>
                         <div class="form-group">
-                            <label for="published_year">Published Year</label>
-                            <input type="text" id="published_year" name="published_year" class="form-control">
-                        </div>
-                        <div class="form-group">
-                            <label for="publisher">Publisher</label>
-                            <input type="text" id="publisher" name="publisher" class="form-control">
+                            <label for="published_year">Publication Year (optional):</label>
+                            <input type="number" id="published_year" name="published_year" class="form-control" min="1800" max="<?php echo date('Y'); ?>">
                         </div>
                     </div>
-                    <div class="form-group text-right">
-                        <button type="submit" name="add_book" class="btn btn-primary">Add Book</button>
+                    <div class="form-group">
+                        <label for="book_cover">Book Cover (optional):</label>
+                        <input type="file" id="book_cover" name="book_cover" class="form-control" accept="image/*" onchange="previewImage(this)">
+                        <img id="coverPreview" class="cover-preview" style="display: none;">
                     </div>
+                    <button type="submit" name="add_book" class="btn btn-primary">Add Book</button>
                 </form>
             </div>
         </div>
         
-        <div id="updateCopiesModal" class="modal">
+        <!-- Update Copies Modal -->
+        <div id="updateModal" class="modal">
             <div class="modal-content">
-                <span class="close" onclick="closeModal('updateCopiesModal')">&times;</span>
+                <span class="close" onclick="closeModal('updateModal')">&times;</span>
                 <h2>Update Book Copies</h2>
                 <form method="post">
                     <input type="hidden" id="update_book_id" name="book_id">
                     <div class="form-group">
-                        <label for="additional_copies">Add Copies</label>
-                        <input type="number" id="additional_copies" name="additional_copies" class="form-control" min="1" value="1" required>
+                        <label for="additional_copies">Add/Remove Copies (use negative numbers to remove):</label>
+                        <input type="number" id="additional_copies" name="additional_copies" class="form-control" required>
                     </div>
-                    <div class="form-group text-right">
-                        <button type="submit" name="update_copies" class="btn btn-primary">Update Copies</button>
-                    </div>
+                    <button type="submit" name="update_copies" class="btn btn-primary">Update Copies</button>
                 </form>
             </div>
         </div>
         
-        <div id="userLimitModal" class="modal">
+        <!-- Update User Limit Modal -->
+        <div id="updateLimitModal" class="modal">
             <div class="modal-content">
-                <span class="close" onclick="closeModal('userLimitModal')">&times;</span>
+                <span class="close" onclick="closeModal('updateLimitModal')">&times;</span>
                 <h2>Update User Borrowing Limit</h2>
                 <form method="post">
-                    <input type="hidden" id="limit_user_id" name="user_id">
+                    <input type="hidden" id="update_user_id" name="user_id">
                     <div class="form-group">
-                        <label for="new_limit">New Borrowing Limit</label>
-                        <input type="number" id="new_limit" name="new_limit" class="form-control" min="1" required>
+                        <label for="new_limit">New Borrowing Limit:</label>
+                        <input type="number" id="new_limit" name="new_limit" class="form-control" min="0" max="20" required>
                     </div>
-                    <div class="form-group text-right">
-                        <button type="submit" name="update_user_limit" class="btn btn-primary">Update Limit</button>
-                    </div>
+                    <button type="submit" name="update_user_limit" class="btn btn-primary">Update Limit</button>
                 </form>
             </div>
         </div>
         
-        <script>
-            // Make the first tab active by default
-            document.addEventListener('DOMContentLoaded', function() {
-                openTab('books');
-            });
-            
-            function openTab(tabName) {
-                // Hide all tab contents
-                var tabContents = document.getElementsByClassName('tab-content');
-                for (var i = 0; i < tabContents.length; i++) {
-                    tabContents[i].style.display = 'none';
-                }
-                
-                // Remove active class from all tabs
-                var tabs = document.getElementsByClassName('tab-link');
-                for (var i = 0; i < tabs.length; i++) {
-                    tabs[i].classList.remove('active');
-                }
-                
-                // Show the selected tab content and mark it as active
-                document.getElementById(tabName + '-tab').style.display = 'block';
-                
-                // Find the clicked tab and add active class
-                var tabs = document.getElementsByClassName('tab-link');
-                for (var i = 0; i < tabs.length; i++) {
-                    if (tabs[i].getAttribute('onclick').includes(tabName)) {
-                        tabs[i].classList.add('active');
-                    }
-                }
-            }
-            
-            function openModal(modalId) {
-                document.getElementById(modalId).style.display = 'block';
-            }
-            
-            function closeModal(modalId) {
-                document.getElementById(modalId).style.display = 'none';
-            }
-            
-            function openUpdateModal(bookId) {
-                document.getElementById('update_book_id').value = bookId;
-                openModal('updateCopiesModal');
-            }
-            
-            function openUserLimitModal(userId, currentLimit) {
-                document.getElementById('limit_user_id').value = userId;
-                document.getElementById('new_limit').value = currentLimit;
-                openModal('userLimitModal');
-            }
-            
-            // Close modals when clicking outside
-            window.onclick = function(event) {
-                var modals = document.getElementsByClassName('modal');
-                for (var i = 0; i < modals.length; i++) {
-                    if (event.target == modals[i]) {
-                        modals[i].style.display = 'none';
-                    }
-                }
-            }
-        </script>
+        <!-- Add Admin Modal -->
+        <?php if ($is_sadmin): ?>
+        <div id="addAdminModal" class="modal">
+            <div class="modal-content">
+                <span class="close" onclick="closeModal('addAdminModal')">&times;</span>
+                <h2>Add New Administrator</h2>
+                <form method="post">
+                    <div class="form-group">
+                        <label for="admin_username">Username:</label>
+                        <input type="text" id="admin_username" name="admin_username" class="form-control" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="admin_email">Email:</label>
+                        <input type="email" id="admin_email" name="admin_email" class="form-control" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="admin_password">Password:</label>
+                        <input type="password" id="admin_password" name="admin_password" class="form-control" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="admin_role">Role:</label>
+                        <select id="admin_role" name="admin_role" class="form-control" required>
+                            <option value="ADMIN">Regular Admin</option>
+                            <option value="SADMIN">Super Admin</option>
+                        </select>
+                    </div>
+                    <button type="submit" name="create_admin" class="btn btn-primary">Create Admin</button>
+                </form>
+            </div>
+        </div>
+        <?php endif; ?>
+        
+        
     </div>
 </body>
 </html>
+<?php mysqli_close($conn); ?>
+
+
+
+
+
+
 
